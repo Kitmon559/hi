@@ -1,0 +1,1155 @@
+--// ==================== ЗАЧИСТКА ====================
+if _G.__FarmKillAll then pcall(_G.__FarmKillAll); task.wait(0.3) end
+_G.__FarmRunning = true
+_G.__FarmKillAll = function() _G.__FarmRunning = false end
+
+for _, gui in ipairs(game.Players.LocalPlayer.PlayerGui:GetChildren()) do
+    if gui.Name == "FarmMenu" then pcall(function() gui:Destroy() end) end
+end
+
+--// ==================== СОХРАНЕНИЕ КОНФИГА ====================
+local HttpService = game:GetService("HttpService")
+local CONFIG_FILE = "FarmMenu_Config.json"
+
+local Config = {
+    Speed = 100,
+    StandTime = 1.5,
+    HoleThreshold = 10,
+    MenuVisible = true,
+    WindowSizeX = 380,
+    WindowSizeY = 780,
+    WindowPosX = -190,
+    WindowPosY = -390,
+    SelectedItems = {},
+    HoleTriggerEnabled = false,
+    TriggerCooldown = 2,
+}
+
+local function LoadConfig()
+    if _G.__FarmConfig then
+        for k, v in pairs(_G.__FarmConfig) do
+            if Config[k] ~= nil then Config[k] = v end
+        end
+    end
+    pcall(function()
+        if readfile and isfile and isfile(CONFIG_FILE) then
+            local data = HttpService:JSONDecode(readfile(CONFIG_FILE))
+            for k, v in pairs(data) do
+                if Config[k] ~= nil then Config[k] = v end
+            end
+            print("[Farm] ✅ Конфиг загружен из файла")
+        end
+    end)
+end
+
+local function SaveConfig()
+    _G.__FarmConfig = Config
+    pcall(function()
+        if writefile then
+            writefile(CONFIG_FILE, HttpService:JSONEncode(Config))
+        end
+    end)
+end
+
+LoadConfig()
+
+-- Восстанавливаем SelectedItems
+local SelectedItems = {}
+do
+    local tmp = {}
+    if type(Config.SelectedItems) == "table" then
+        for k, v in pairs(Config.SelectedItems) do
+            if type(k) == "number" then tmp[v] = true
+            elseif v == true then tmp[k] = true end
+        end
+    end
+    SelectedItems = tmp
+end
+
+local function SaveSelectedItems()
+    local arr = {}
+    for name, _ in pairs(SelectedItems) do
+        table.insert(arr, name)
+    end
+    Config.SelectedItems = arr
+    SaveConfig()
+end
+
+--// ==================== НАСТРОЙКИ ====================
+local TargetFolder = workspace:WaitForChild("SpawnedItems")
+local HolesFolder = workspace:WaitForChild("AuxHoles")
+
+local Players = game:GetService("Players")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+local CurrentSpeed = Config.Speed
+local StandTime = Config.StandTime
+local AutoFarm = false
+local Busy = false
+
+local MoveTarget, MoveActive, moveConnection = nil, false, nil
+
+--// ==================== РЕДКОСТИ ====================
+local Rarities = {
+    Common = { color = Color3.fromRGB(180, 180, 180),
+        items = {"Trash Box", "Calendars", "Battery"} },
+    Uncommon = { color = Color3.fromRGB(80, 200, 80),
+        items = {"Crate", "Bench", "Beach Chair"} },
+    Rare = { color = Color3.fromRGB(80, 150, 255),
+        items = {"Wallet", "Iron Ladder", "Chocolate Bar", "Anvil"} },
+    Epic = { color = Color3.fromRGB(180, 80, 255),
+        items = {"Iron Safe", "Barrier", "Aquarium"} },
+    Legendary = { color = Color3.fromRGB(255, 180, 0),
+        items = {"Water Cooler", "Traffic Cone", "Pigeon", "Office Chair", "Fridge", "Carp", "Bus Stop"} },
+    Mythic = { color = Color3.fromRGB(255, 80, 80),
+        items = {"Vending Machine", "Tape", "Shopping Cart", "Roadrolleeeeerr",
+                 "Microwave", "Magnet Block", "Hot Bog Stand",
+                 "Glitchy Butter Blok", "CRT TV"} },
+    Exotic = { color = Color3.fromRGB(0, 220, 255),
+        items = {"Telephone Booth", "Couch", "Chilythrily"} }
+}
+
+local RarityOrder = {"Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Exotic"}
+local ItemRarityMap = {}
+for rarityName, data in pairs(Rarities) do
+    for _, itemName in ipairs(data.items) do
+        ItemRarityMap[itemName] = rarityName
+    end
+end
+
+local function NormalizeName(name)
+    return name:gsub("%s*%d+$", ""):gsub("%s+$", ""):lower():gsub("%s+", "")
+end
+
+local function GetItemRarity(itemName)
+    if ItemRarityMap[itemName] then return ItemRarityMap[itemName] end
+    local n = NormalizeName(itemName)
+    for name, r in pairs(ItemRarityMap) do
+        if NormalizeName(name) == n then return r end
+    end
+    return "Common"
+end
+
+local function GetRarityColor(r) return Rarities[r] and Rarities[r].color or Color3.fromRGB(200,200,200) end
+
+--// ==================== 🔍 HOLEITEMS (ФИКС КЭША) ====================
+local HoleItemsMode = nil
+local HoleItemsInstance = nil
+local HoleItemsAttrName = nil
+local HoleItemsPath = nil
+
+local function FindHoleItems()
+    local lp = LocalPlayer
+    if not lp then return nil end
+    
+    -- 🎯 Атрибут "HoleItems" (большая H) — берём ПЕРВЫМ
+    if lp:GetAttribute("HoleItems") ~= nil then
+        HoleItemsMode = "attribute"
+        HoleItemsAttrName = "HoleItems"
+        HoleItemsPath = "Attribute 'HoleItems'"
+        return "ATTR"
+    end
+    
+    -- Атрибут "holeitems" (маленькие)
+    if lp:GetAttribute("holeitems") ~= nil then
+        HoleItemsMode = "attribute"
+        HoleItemsAttrName = "holeitems"
+        HoleItemsPath = "Attribute 'holeitems'"
+        return "ATTR"
+    end
+    
+    -- Instance HoleItems
+    local v = lp:FindFirstChild("HoleItems")
+    if v and v:IsA("ValueBase") then
+        HoleItemsMode = "instance"
+        HoleItemsInstance = v
+        HoleItemsPath = "LocalPlayer.HoleItems"
+        return v
+    end
+    
+    -- Instance holeitems
+    v = lp:FindFirstChild("holeitems")
+    if v and v:IsA("ValueBase") then
+        HoleItemsMode = "instance"
+        HoleItemsInstance = v
+        HoleItemsPath = "LocalPlayer.holeitems"
+        return v
+    end
+    
+    -- leaderstats
+    local ls = lp:FindFirstChild("leaderstats")
+    if ls then
+        v = ls:FindFirstChild("HoleItems") or ls:FindFirstChild("holeitems")
+        if v then
+            HoleItemsMode = "instance"
+            HoleItemsInstance = v
+            HoleItemsPath = "LocalPlayer.leaderstats." .. v.Name
+            return v
+        end
+    end
+    
+    return nil
+end
+
+FindHoleItems()
+
+-- 🔥 ЧТЕНИЕ ВСЕГДА СВЕЖЕЕ (не кэшируется)
+local function GetHoleItems()
+    local lp = LocalPlayer
+    if not lp then return 0 end
+    
+    -- Атрибут — читаем заново
+    if HoleItemsMode == "attribute" and HoleItemsAttrName then
+        return tonumber(lp:GetAttribute(HoleItemsAttrName)) or 0
+    end
+    
+    -- Instance — читаем .Value
+    if HoleItemsMode == "instance" and HoleItemsInstance then
+        if not HoleItemsInstance.Parent then
+            FindHoleItems()
+            if HoleItemsMode == "attribute" and HoleItemsAttrName then
+                return tonumber(lp:GetAttribute(HoleItemsAttrName)) or 0
+            end
+        end
+        if HoleItemsInstance and HoleItemsInstance.Parent then
+            local ok, val = pcall(function() return HoleItemsInstance.Value end)
+            if ok and val ~= nil then return tonumber(val) or 0 end
+        end
+    end
+    
+    -- Переискиваем
+    FindHoleItems()
+    if HoleItemsMode == "attribute" and HoleItemsAttrName then
+        return tonumber(lp:GetAttribute(HoleItemsAttrName)) or 0
+    elseif HoleItemsMode == "instance" and HoleItemsInstance and HoleItemsInstance.Parent then
+        local ok, val = pcall(function() return HoleItemsInstance.Value end)
+        if ok and val ~= nil then return tonumber(val) or 0 end
+    end
+    
+    return 0
+end
+
+print("=========================================")
+print("[Farm] HoleItems поиск:")
+print("[Farm] Mode:", tostring(HoleItemsMode), "| Path:", tostring(HoleItemsPath))
+print("[Farm] Значение:", GetHoleItems())
+print("=========================================")
+
+--// ==================== GUI ====================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "FarmMenu"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local OpenButton = Instance.new("TextButton")
+OpenButton.Size = UDim2.new(0, 130, 0, 40)
+OpenButton.Position = UDim2.new(0, 20, 0.5, -20)
+OpenButton.BackgroundColor3 = Color3.fromRGB(60, 130, 220)
+OpenButton.BorderSizePixel = 0
+OpenButton.Text = "🌀 Открыть меню"
+OpenButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+OpenButton.TextSize = 14
+OpenButton.Font = Enum.Font.GothamBold
+OpenButton.Visible = not Config.MenuVisible
+OpenButton.Parent = ScreenGui
+Instance.new("UICorner", OpenButton).CornerRadius = UDim.new(0, 6)
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, Config.WindowSizeX, 0, Config.WindowSizeY)
+MainFrame.Position = UDim2.new(0.5, Config.WindowPosX, 0.5, Config.WindowPosY)
+MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Visible = Config.MenuVisible
+MainFrame.Parent = ScreenGui
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+local UIStroke = Instance.new("UIStroke", MainFrame)
+UIStroke.Color = Color3.fromRGB(80, 80, 90)
+UIStroke.Thickness = 2
+
+local dragSaveTimer = nil
+MainFrame:GetPropertyChangedSignal("Position"):Connect(function()
+    if dragSaveTimer then task.cancel(dragSaveTimer) end
+    dragSaveTimer = task.delay(0.5, function()
+        Config.WindowPosX = MainFrame.Position.X.Offset
+        Config.WindowPosY = MainFrame.Position.Y.Offset
+        SaveConfig()
+    end)
+end)
+
+local Resizer = Instance.new("TextButton")
+Resizer.Size = UDim2.new(0, 20, 0, 20)
+Resizer.Position = UDim2.new(1, -22, 1, -22)
+Resizer.BackgroundColor3 = Color3.fromRGB(60, 60, 75)
+Resizer.BorderSizePixel = 0
+Resizer.Text = "◢"
+Resizer.TextColor3 = Color3.fromRGB(180, 180, 200)
+Resizer.TextSize = 14
+Resizer.Font = Enum.Font.GothamBold
+Resizer.Parent = MainFrame
+Instance.new("UICorner", Resizer).CornerRadius = UDim.new(0, 4)
+
+do
+    local dragging, dragStart, startSize = false, nil, nil
+    Resizer.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startSize = MainFrame.AbsoluteSize
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            MainFrame.Size = UDim2.new(0, math.max(320, startSize.X + delta.X), 0, math.max(400, startSize.Y + delta.Y))
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) and dragging then
+            dragging = false
+            Config.WindowSizeX = MainFrame.AbsoluteSize.X
+            Config.WindowSizeY = MainFrame.AbsoluteSize.Y
+            SaveConfig()
+        end
+    end)
+end
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 40)
+Title.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+Title.BorderSizePixel = 0
+Title.Text = "🌀 Auto Farm Menu"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.TextSize = 18
+Title.Font = Enum.Font.GothamBold
+Title.Parent = MainFrame
+Instance.new("UICorner", Title).CornerRadius = UDim.new(0, 10)
+
+local MinimizeBtn = Instance.new("TextButton")
+MinimizeBtn.Size = UDim2.new(0, 30, 0, 30)
+MinimizeBtn.Position = UDim2.new(1, -70, 0, 5)
+MinimizeBtn.BackgroundColor3 = Color3.fromRGB(200, 150, 50)
+MinimizeBtn.BorderSizePixel = 0
+MinimizeBtn.Text = "—"
+MinimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+MinimizeBtn.TextSize = 16
+MinimizeBtn.Font = Enum.Font.GothamBold
+MinimizeBtn.Parent = MainFrame
+Instance.new("UICorner", MinimizeBtn).CornerRadius = UDim.new(0, 15)
+
+local CloseButton = Instance.new("TextButton")
+CloseButton.Size = UDim2.new(0, 30, 0, 30)
+CloseButton.Position = UDim2.new(1, -35, 0, 5)
+CloseButton.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+CloseButton.BorderSizePixel = 0
+CloseButton.Text = "✕"
+CloseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseButton.TextSize = 16
+CloseButton.Font = Enum.Font.GothamBold
+CloseButton.Parent = MainFrame
+Instance.new("UICorner", CloseButton).CornerRadius = UDim.new(0, 15)
+
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Size = UDim2.new(1, -20, 0, 22)
+StatusLabel.Position = UDim2.new(0, 10, 0, 42)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Text = "Выбрано: 0"
+StatusLabel.TextColor3 = Color3.fromRGB(150, 200, 255)
+StatusLabel.TextSize = 13
+StatusLabel.Font = Enum.Font.Gotham
+StatusLabel.Parent = MainFrame
+
+local SelectAllBtn = Instance.new("TextButton")
+SelectAllBtn.Size = UDim2.new(0.48, -5, 0, 24)
+SelectAllBtn.Position = UDim2.new(0, 10, 0, 68)
+SelectAllBtn.BackgroundColor3 = Color3.fromRGB(60, 100, 60)
+SelectAllBtn.BorderSizePixel = 0
+SelectAllBtn.Text = "✓ Выбрать все"
+SelectAllBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+SelectAllBtn.TextSize = 12
+SelectAllBtn.Font = Enum.Font.GothamBold
+SelectAllBtn.Parent = MainFrame
+Instance.new("UICorner", SelectAllBtn).CornerRadius = UDim.new(0, 4)
+
+local ClearAllBtn = Instance.new("TextButton")
+ClearAllBtn.Size = UDim2.new(0.48, -5, 0, 24)
+ClearAllBtn.Position = UDim2.new(0.52, 5, 0, 68)
+ClearAllBtn.BackgroundColor3 = Color3.fromRGB(100, 60, 60)
+ClearAllBtn.BorderSizePixel = 0
+ClearAllBtn.Text = "✕ Снять все"
+ClearAllBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ClearAllBtn.TextSize = 12
+ClearAllBtn.Font = Enum.Font.GothamBold
+ClearAllBtn.Parent = MainFrame
+Instance.new("UICorner", ClearAllBtn).CornerRadius = UDim.new(0, 4)
+
+local ItemListFrame = Instance.new("ScrollingFrame")
+ItemListFrame.Size = UDim2.new(1, -20, 0, 180)
+ItemListFrame.Position = UDim2.new(0, 10, 0, 98)
+ItemListFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+ItemListFrame.BorderSizePixel = 0
+ItemListFrame.ScrollBarThickness = 5
+ItemListFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+ItemListFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+ItemListFrame.Parent = MainFrame
+Instance.new("UICorner", ItemListFrame).CornerRadius = UDim.new(0, 6)
+
+local ListLayout = Instance.new("UIListLayout", ItemListFrame)
+ListLayout.Padding = UDim.new(0, 2)
+ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+local ListPadding = Instance.new("UIPadding", ItemListFrame)
+ListPadding.PaddingTop = UDim.new(0, 5)
+ListPadding.PaddingBottom = UDim.new(0, 5)
+ListPadding.PaddingLeft = UDim.new(0, 5)
+ListPadding.PaddingRight = UDim.new(0, 5)
+
+local HoleItemsLabel = Instance.new("TextLabel")
+HoleItemsLabel.Size = UDim2.new(1, -20, 0, 26)
+HoleItemsLabel.Position = UDim2.new(0, 10, 0, 285)
+HoleItemsLabel.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+HoleItemsLabel.BorderSizePixel = 0
+HoleItemsLabel.Text = "📦 HoleItems: ..."
+HoleItemsLabel.TextColor3 = Color3.fromRGB(255, 220, 100)
+HoleItemsLabel.TextSize = 13
+HoleItemsLabel.Font = Enum.Font.GothamBold
+HoleItemsLabel.Parent = MainFrame
+Instance.new("UICorner", HoleItemsLabel).CornerRadius = UDim.new(0, 6)
+
+local SpeedLabel = Instance.new("TextLabel")
+SpeedLabel.Size = UDim2.new(1, -20, 0, 20)
+SpeedLabel.Position = UDim2.new(0, 10, 0, 318)
+SpeedLabel.BackgroundTransparency = 1
+SpeedLabel.Text = "Скорость (studs/s): " .. CurrentSpeed
+SpeedLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+SpeedLabel.TextSize = 14
+SpeedLabel.Font = Enum.Font.Gotham
+SpeedLabel.TextXAlignment = Enum.TextXAlignment.Left
+SpeedLabel.Parent = MainFrame
+
+local SpeedBox = Instance.new("TextBox")
+SpeedBox.Size = UDim2.new(1, -20, 0, 30)
+SpeedBox.Position = UDim2.new(0, 10, 0, 342)
+SpeedBox.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+SpeedBox.BorderSizePixel = 0
+SpeedBox.Text = tostring(CurrentSpeed)
+SpeedBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+SpeedBox.TextSize = 14
+SpeedBox.Font = Enum.Font.Gotham
+SpeedBox.Parent = MainFrame
+Instance.new("UICorner", SpeedBox).CornerRadius = UDim.new(0, 6)
+
+local StandLabel = Instance.new("TextLabel")
+StandLabel.Size = UDim2.new(1, -20, 0, 20)
+StandLabel.Position = UDim2.new(0, 10, 0, 378)
+StandLabel.BackgroundTransparency = 1
+StandLabel.Text = "Стоять у дырки (сек): " .. StandTime
+StandLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+StandLabel.TextSize = 14
+StandLabel.Font = Enum.Font.Gotham
+StandLabel.TextXAlignment = Enum.TextXAlignment.Left
+StandLabel.Parent = MainFrame
+
+local StandBox = Instance.new("TextBox")
+StandBox.Size = UDim2.new(1, -20, 0, 30)
+StandBox.Position = UDim2.new(0, 10, 0, 402)
+StandBox.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+StandBox.BorderSizePixel = 0
+StandBox.Text = tostring(StandTime)
+StandBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+StandBox.TextSize = 14
+StandBox.Font = Enum.Font.Gotham
+StandBox.Parent = MainFrame
+Instance.new("UICorner", StandBox).CornerRadius = UDim.new(0, 6)
+
+local HoleTriggerLabel = Instance.new("TextLabel")
+HoleTriggerLabel.Size = UDim2.new(1, -20, 0, 20)
+HoleTriggerLabel.Position = UDim2.new(0, 10, 0, 438)
+HoleTriggerLabel.BackgroundTransparency = 1
+HoleTriggerLabel.Text = "🎁 Триггер: ВЫКЛ"
+HoleTriggerLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+HoleTriggerLabel.TextSize = 14
+HoleTriggerLabel.Font = Enum.Font.Gotham
+HoleTriggerLabel.TextXAlignment = Enum.TextXAlignment.Left
+HoleTriggerLabel.Parent = MainFrame
+
+local HoleToggleBtn = Instance.new("TextButton")
+HoleToggleBtn.Size = UDim2.new(0.48, -5, 0, 28)
+HoleToggleBtn.Position = UDim2.new(0, 10, 0, 462)
+HoleToggleBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+HoleToggleBtn.BorderSizePixel = 0
+HoleToggleBtn.Text = "Вкл триггер"
+HoleToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+HoleToggleBtn.TextSize = 13
+HoleToggleBtn.Font = Enum.Font.GothamBold
+HoleToggleBtn.Parent = MainFrame
+Instance.new("UICorner", HoleToggleBtn).CornerRadius = UDim.new(0, 4)
+
+local HoleThresholdBox = Instance.new("TextBox")
+HoleThresholdBox.Size = UDim2.new(0.48, -5, 0, 28)
+HoleThresholdBox.Position = UDim2.new(0.52, 5, 0, 462)
+HoleThresholdBox.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+HoleThresholdBox.BorderSizePixel = 0
+HoleThresholdBox.Text = "Порог: " .. Config.HoleThreshold
+HoleThresholdBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+HoleThresholdBox.TextSize = 13
+HoleThresholdBox.Font = Enum.Font.Gotham
+HoleThresholdBox.Parent = MainFrame
+Instance.new("UICorner", HoleThresholdBox).CornerRadius = UDim.new(0, 4)
+
+local HoleLimitLabel = Instance.new("TextLabel")
+HoleLimitLabel.Size = UDim2.new(1, -20, 0, 16)
+HoleLimitLabel.Position = UDim2.new(0, 10, 0, 493)
+HoleLimitLabel.BackgroundTransparency = 1
+HoleLimitLabel.Text = "      (от 3 до 10)"
+HoleLimitLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+HoleLimitLabel.TextSize = 11
+HoleLimitLabel.Font = Enum.Font.Gotham
+HoleLimitLabel.TextXAlignment = Enum.TextXAlignment.Left
+HoleLimitLabel.Parent = MainFrame
+
+local StartButton = Instance.new("TextButton")
+StartButton.Size = UDim2.new(0.48, -5, 0, 40)
+StartButton.Position = UDim2.new(0, 10, 0, 518)
+StartButton.BackgroundColor3 = Color3.fromRGB(60, 130, 220)
+StartButton.BorderSizePixel = 0
+StartButton.Text = "🚀 Разово"
+StartButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+StartButton.TextSize = 14
+StartButton.Font = Enum.Font.GothamBold
+StartButton.Parent = MainFrame
+Instance.new("UICorner", StartButton).CornerRadius = UDim.new(0, 6)
+
+local AutoFarmButton = Instance.new("TextButton")
+AutoFarmButton.Size = UDim2.new(0.48, -5, 0, 40)
+AutoFarmButton.Position = UDim2.new(0.52, 5, 0, 518)
+AutoFarmButton.BackgroundColor3 = Color3.fromRGB(60, 160, 60)
+AutoFarmButton.BorderSizePixel = 0
+AutoFarmButton.Text = "▶ Автофарм"
+AutoFarmButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+AutoFarmButton.TextSize = 14
+AutoFarmButton.Font = Enum.Font.GothamBold
+AutoFarmButton.Parent = MainFrame
+Instance.new("UICorner", AutoFarmButton).CornerRadius = UDim.new(0, 6)
+
+local PermanentCloseButton = Instance.new("TextButton")
+PermanentCloseButton.Size = UDim2.new(1, -20, 0, 28)
+PermanentCloseButton.Position = UDim2.new(0, 10, 0, 568)
+PermanentCloseButton.BackgroundColor3 = Color3.fromRGB(120, 30, 30)
+PermanentCloseButton.BorderSizePixel = 0
+PermanentCloseButton.Text = "❌ Закрыть навсегда"
+PermanentCloseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+PermanentCloseButton.TextSize = 13
+PermanentCloseButton.Font = Enum.Font.GothamBold
+PermanentCloseButton.Parent = MainFrame
+Instance.new("UICorner", PermanentCloseButton).CornerRadius = UDim.new(0, 6)
+
+--// ==================== ХЕЛПЕРЫ ====================
+local ItemButtons = {}
+
+local function SetStatus(text, color)
+    StatusLabel.Text = text
+    StatusLabel.TextColor3 = color or Color3.fromRGB(150, 200, 255)
+end
+
+local function CountSelected()
+    local c = 0
+    for _ in pairs(SelectedItems) do c = c + 1 end
+    return c
+end
+
+local function UpdateSelectedLabel()
+    SetStatus("Выбрано: " .. CountSelected())
+end
+
+local function GetItemPosition(item)
+    if not item or not item.Parent then return nil end
+    if item:IsA("BasePart") then return item.Position
+    elseif item:IsA("Model") then
+        local ok, p = pcall(function() return item:GetPivot() end)
+        if ok then return p.Position end
+    end
+    return nil
+end
+
+local function GetNearestHoleFrom(pos)
+    local nearest, nd = nil, math.huge
+    for _, hole in ipairs(HolesFolder:GetChildren()) do
+        local p = GetItemPosition(hole)
+        if p then
+            local d = (pos - p).Magnitude
+            if d < nd then nd = d; nearest = hole end
+        end
+    end
+    return nearest, nd
+end
+
+local function GetNearestHoleFromCurrentPos()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    return GetNearestHoleFrom(hrp.Position)
+end
+
+local function GetRandomSelectedItem()
+    local valid = {}
+    for _, item in ipairs(TargetFolder:GetChildren()) do
+        if item:IsA("BasePart") or item:IsA("Model") then
+            local base = item.Name:gsub("%s*%d+$", ""):gsub("%s+$", "")
+            if SelectedItems[base] then table.insert(valid, item) end
+        end
+    end
+    if #valid == 0 then return nil end
+    return valid[math.random(1, #valid)]
+end
+
+--// ==================== СПИСОК ====================
+local function UpdateAllCounters()
+    local counts = {}
+    for _, item in ipairs(TargetFolder:GetChildren()) do
+        if item:IsA("BasePart") or item:IsA("Model") then
+            local base = item.Name:gsub("%s*%d+$", ""):gsub("%s+$", "")
+            counts[base] = (counts[base] or 0) + 1
+        end
+    end
+    for name, data in pairs(ItemButtons) do
+        local count = counts[name] or 0
+        if data.countLabel then
+            data.countLabel.Text = "x" .. count
+            if count == 0 then
+                data.countLabel.TextColor3 = Color3.fromRGB(110, 110, 110)
+                if data.nameLabel then data.nameLabel.TextColor3 = Color3.fromRGB(110, 110, 110) end
+                if data.btn and not SelectedItems[name] then
+                    data.btn.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+                end
+            else
+                if count <= 2 then data.countLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+                elseif count <= 5 then data.countLabel.TextColor3 = Color3.fromRGB(150, 255, 150)
+                else data.countLabel.TextColor3 = Color3.fromRGB(100, 255, 100) end
+                if data.nameLabel then data.nameLabel.TextColor3 = Color3.fromRGB(220, 220, 220) end
+                if data.btn and not SelectedItems[name] then
+                    data.btn.BackgroundColor3 = Color3.fromRGB(50, 50, 65)
+                end
+            end
+        end
+    end
+end
+
+local function RefreshItemList()
+    for _, c in ipairs(ItemListFrame:GetChildren()) do
+        if c:IsA("TextButton") or c:IsA("TextLabel") then c:Destroy() end
+    end
+    ItemButtons = {}
+    
+    local counts = {}
+    for _, item in ipairs(TargetFolder:GetChildren()) do
+        if item:IsA("BasePart") or item:IsA("Model") then
+            local base = item.Name:gsub("%s*%d+$", ""):gsub("%s+$", "")
+            counts[base] = (counts[base] or 0) + 1
+        end
+    end
+    
+    local byRarity = {}
+    for _, r in ipairs(RarityOrder) do byRarity[r] = {} end
+    
+    for rarityName, data in pairs(Rarities) do
+        for _, itemName in ipairs(data.items) do
+            table.insert(byRarity[rarityName], {
+                name = itemName, displayName = itemName,
+                count = counts[itemName] or 0, rarity = rarityName
+            })
+        end
+    end
+    
+    local known = {}
+    for _, data in pairs(Rarities) do
+        for _, n in ipairs(data.items) do known[n:lower():gsub("%s+", "")] = true end
+    end
+    for baseName, count in pairs(counts) do
+        if not known[baseName:lower():gsub("%s+", "")] then
+            table.insert(byRarity["Common"], {
+                name = baseName, displayName = baseName, count = count, rarity = "Common"
+            })
+        end
+    end
+    
+    for _, rarityName in ipairs(RarityOrder) do
+        local items = byRarity[rarityName]
+        if not items or #items == 0 then continue end
+        table.sort(items, function(a, b) return a.name:lower() < b.name:lower() end)
+        
+        local total = 0
+        for _, it in ipairs(items) do total = total + it.count end
+        
+        local header = Instance.new("TextLabel")
+        header.Size = UDim2.new(1, 0, 0, 20)
+        header.BackgroundColor3 = GetRarityColor(rarityName):Lerp(Color3.new(0,0,0), 0.7)
+        header.BorderSizePixel = 0
+        header.Text = "  " .. rarityName:upper() .. " (" .. #items .. " видов / " .. total .. " шт)"
+        header.TextColor3 = GetRarityColor(rarityName)
+        header.TextSize = 11
+        header.Font = Enum.Font.GothamBold
+        header.TextXAlignment = Enum.TextXAlignment.Left
+        header.Parent = ItemListFrame
+        Instance.new("UICorner", header).CornerRadius = UDim.new(0, 4)
+        
+        for _, data in ipairs(items) do
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, 0, 0, 24)
+            btn.BorderSizePixel = 0
+            btn.Text = ""
+            btn.BackgroundColor3 = data.count == 0 and Color3.fromRGB(28, 28, 32) or Color3.fromRGB(50, 50, 65)
+            btn.Parent = ItemListFrame
+            Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+            
+            local bar = Instance.new("Frame")
+            bar.Size = UDim2.new(0, 4, 1, 0)
+            bar.BackgroundColor3 = data.count == 0 and GetRarityColor(rarityName):Lerp(Color3.fromRGB(50,50,50), 0.7) or GetRarityColor(rarityName)
+            bar.BorderSizePixel = 0
+            bar.Parent = btn
+            Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 2)
+            
+            local nameLabel = Instance.new("TextLabel")
+            nameLabel.Size = UDim2.new(1, -60, 1, 0)
+            nameLabel.Position = UDim2.new(0, 10, 0, 0)
+            nameLabel.BackgroundTransparency = 1
+            nameLabel.Text = "  " .. data.displayName
+            nameLabel.TextColor3 = data.count == 0 and Color3.fromRGB(110,110,110) or Color3.fromRGB(220,220,220)
+            nameLabel.TextSize = 12
+            nameLabel.Font = Enum.Font.Gotham
+            nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+            nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+            nameLabel.Parent = btn
+            
+            local countLabel = Instance.new("TextLabel")
+            countLabel.Size = UDim2.new(0, 45, 1, 0)
+            countLabel.Position = UDim2.new(1, -50, 0, 0)
+            countLabel.BackgroundTransparency = 1
+            countLabel.Text = "x" .. data.count
+            countLabel.TextSize = 12
+            countLabel.Font = Enum.Font.GothamBold
+            countLabel.TextXAlignment = Enum.TextXAlignment.Right
+            countLabel.Parent = btn
+            
+            if data.count == 0 then countLabel.TextColor3 = Color3.fromRGB(110, 110, 110)
+            elseif data.count <= 2 then countLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+            elseif data.count <= 5 then countLabel.TextColor3 = Color3.fromRGB(150, 255, 150)
+            else countLabel.TextColor3 = Color3.fromRGB(100, 255, 100) end
+            
+            ItemButtons[data.name] = {btn = btn, countLabel = countLabel, nameLabel = nameLabel, name = data.name}
+            
+            if SelectedItems[data.name] then
+                btn.BackgroundColor3 = Color3.fromRGB(60, 130, 220)
+            end
+            
+            btn.MouseButton1Click:Connect(function()
+                if SelectedItems[data.name] then
+                    SelectedItems[data.name] = nil
+                    local c = tonumber(countLabel.Text:sub(2)) or 0
+                    btn.BackgroundColor3 = c == 0 and Color3.fromRGB(28, 28, 32) or Color3.fromRGB(50, 50, 65)
+                else
+                    SelectedItems[data.name] = true
+                    btn.BackgroundColor3 = Color3.fromRGB(60, 130, 220)
+                end
+                if not AutoFarm then UpdateSelectedLabel() end
+                SaveSelectedItems()
+            end)
+        end
+    end
+    
+    UpdateSelectedLabel()
+end
+
+SelectAllBtn.MouseButton1Click:Connect(function()
+    for name, _ in pairs(ItemButtons) do
+        SelectedItems[name] = true
+        if ItemButtons[name].btn then
+            ItemButtons[name].btn.BackgroundColor3 = Color3.fromRGB(60, 130, 220)
+        end
+    end
+    UpdateSelectedLabel()
+    SaveSelectedItems()
+end)
+
+ClearAllBtn.MouseButton1Click:Connect(function()
+    for name, _ in pairs(ItemButtons) do
+        SelectedItems[name] = nil
+        if ItemButtons[name].btn then
+            local c = tonumber(ItemButtons[name].countLabel.Text:sub(2)) or 0
+            ItemButtons[name].btn.BackgroundColor3 = c == 0 and Color3.fromRGB(28, 28, 32) or Color3.fromRGB(50, 50, 65)
+        end
+    end
+    UpdateSelectedLabel()
+    SaveSelectedItems()
+end)
+
+--// ==================== ДВИЖЕНИЕ ====================
+local function StopMove()
+    MoveActive = false
+    MoveTarget = nil
+    if moveConnection then moveConnection:Disconnect(); moveConnection = nil end
+end
+
+local function MoveToSmart(targetGetter, timeout)
+    timeout = timeout or 20
+    StopMove()
+    MoveActive = true
+    local startT = tick()
+    
+    moveConnection = RunService.Heartbeat:Connect(function(dt)
+        if not MoveActive then return end
+        local char = LocalPlayer.Character
+        if not char then return end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        
+        hrp.AssemblyLinearVelocity = Vector3.new(0,0,0)
+        hrp.AssemblyAngularVelocity = Vector3.new(0,0,0)
+        hrp.Velocity = Vector3.new(0,0,0)
+        
+        local target = targetGetter()
+        if not target then return end
+        MoveTarget = target
+        
+        local cur = hrp.Position
+        local diff = MoveTarget - cur
+        local dist = diff.Magnitude
+        
+        if dist < 2 then
+            hrp.CFrame = CFrame.new(MoveTarget)
+            MoveActive = false
+            return
+        end
+        
+        local step = CurrentSpeed * dt
+        if step > dist then step = dist end
+        hrp.CFrame = CFrame.new(cur + diff.Unit * step)
+    end)
+    
+    while MoveActive and (tick() - startT) < timeout do task.wait(0.05) end
+    StopMove()
+end
+
+--// ==================== ВВОД ====================
+local function PressE()
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(0.04)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+end
+
+local function PressLeftClick()
+    pcall(function()
+        local vp = workspace.CurrentCamera.ViewportSize
+        VirtualInputManager:SendMouseButtonEvent(vp.X/2, vp.Y/2, 0, true, game, 0)
+        task.wait(0.05)
+        VirtualInputManager:SendMouseButtonEvent(vp.X/2, vp.Y/2, 0, false, game, 0)
+    end)
+    pcall(function()
+        local VU = game:GetService("VirtualUser")
+        VU:CaptureController()
+        VU:ClickButton1(Vector2.new(workspace.CurrentCamera.ViewportSize.X/2, workspace.CurrentCamera.ViewportSize.Y/2))
+    end)
+end
+
+--// ==================== HOLE TRIGGER ====================
+local HoleTriggerEnabled = Config.HoleTriggerEnabled or false
+local HoleTriggerThreshold = Config.HoleThreshold
+local lastTriggerTime = 0
+local TRIGGER_COOLDOWN = Config.TriggerCooldown or 2
+
+local HoleGiveRemote = nil
+pcall(function()
+    HoleGiveRemote = game:GetService("ReplicatedStorage"):WaitForChild("Remotes"):WaitForChild("HoleGiveMe")
+end)
+print("[Farm] Remote:", HoleGiveRemote)
+
+local function FireHoleGive()
+    if not HoleGiveRemote then 
+        warn("[Farm] Remote HoleGiveMe не найден!")
+        return false 
+    end
+    local ok, err = pcall(function() HoleGiveRemote:InvokeServer() end)
+    if ok then 
+        print("[Farm] 🎁 HoleGiveMe вызван! HoleItems был:", GetHoleItems()) 
+        return true
+    else
+        warn("[Farm] Ошибка HoleGiveMe:", err)
+        return false
+    end
+end
+
+if HoleTriggerEnabled then
+    HoleToggleBtn.Text = "Выкл триггер"
+    HoleToggleBtn.BackgroundColor3 = Color3.fromRGB(200, 100, 60)
+    HoleTriggerLabel.Text = "🎁 Триггер: ВКЛ (" .. HoleTriggerThreshold .. ")"
+    HoleTriggerLabel.TextColor3 = Color3.fromRGB(255, 180, 100)
+end
+
+HoleToggleBtn.MouseButton1Click:Connect(function()
+    HoleTriggerEnabled = not HoleTriggerEnabled
+    Config.HoleTriggerEnabled = HoleTriggerEnabled
+    SaveConfig()
+    
+    if HoleTriggerEnabled then
+        HoleToggleBtn.Text = "Выкл триггер"
+        HoleToggleBtn.BackgroundColor3 = Color3.fromRGB(200, 100, 60)
+        HoleTriggerLabel.Text = "🎁 Триггер: ВКЛ (" .. HoleTriggerThreshold .. ")"
+        HoleTriggerLabel.TextColor3 = Color3.fromRGB(255, 180, 100)
+        print("[Farm] Триггер ВКЛ, HoleItems =", GetHoleItems(), "@", HoleItemsPath or "❌")
+    else
+        HoleToggleBtn.Text = "Вкл триггер"
+        HoleToggleBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+        HoleTriggerLabel.Text = "🎁 Триггер: ВЫКЛ"
+        HoleTriggerLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    end
+end)
+
+HoleThresholdBox.FocusLost:Connect(function()
+    local n = tonumber(HoleThresholdBox.Text:match("%d+"))
+    if n then
+        if n < 3 then n = 3; SetStatus("⚠️ Минимум 3!", Color3.fromRGB(255, 200, 100))
+        elseif n > 10 then n = 10; SetStatus("⚠️ Максимум 10!", Color3.fromRGB(255, 200, 100)) end
+        HoleTriggerThreshold = n
+        Config.HoleThreshold = n
+        SaveConfig()
+        HoleThresholdBox.Text = "Порог: " .. n
+        if HoleTriggerEnabled then
+            HoleTriggerLabel.Text = "🎁 Триггер: ВКЛ (" .. n .. ")"
+        end
+    else
+        HoleThresholdBox.Text = "Порог: " .. HoleTriggerThreshold
+    end
+end)
+
+--// ==================== ЦИКЛ ====================
+local function FarmCycle()
+    local item = GetRandomSelectedItem()
+    if not item then return false end
+    
+    SetStatus("🚀 К предмету: " .. item.Name, Color3.fromRGB(255, 220, 100))
+    MoveToSmart(function() return GetItemPosition(item) end, 20)
+    task.wait(0.2)
+    
+    if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then return false end
+    
+    SetStatus("✋ Берём: " .. item.Name, Color3.fromRGB(255, 180, 100))
+    for i = 1, 4 do PressE(); task.wait(0.15) end
+    task.wait(0.5)
+    
+    local chosenHoleName = "?"
+    SetStatus("🕳️ Ищем дырку...", Color3.fromRGB(150, 255, 150))
+    
+    MoveToSmart(function()
+        local hole, _ = GetNearestHoleFromCurrentPos()
+        if not hole then return nil end
+        if hole.Name ~= chosenHoleName then
+            chosenHoleName = hole.Name
+            SetStatus("🕳️ К дырке: " .. hole.Name, Color3.fromRGB(150, 255, 150))
+        end
+        return GetItemPosition(hole)
+    end, 25)
+    
+    local st = tonumber(StandBox.Text) or 1.5
+    SetStatus("⏱️ Стоим " .. st .. "с...", Color3.fromRGB(200, 200, 255))
+    local el = 0
+    while el < st do task.wait(0.1); el = el + 0.1 end
+    
+    SetStatus("🖱️ Выброс...", Color3.fromRGB(255, 180, 100))
+    PressLeftClick(); task.wait(0.4); PressLeftClick(); task.wait(0.2)
+    return true
+end
+
+local function RunOnce()
+    if Busy then return end
+    Busy = true
+    pcall(FarmCycle)
+    SetStatus("✅ Готово!", Color3.fromRGB(150, 255, 150))
+    task.wait(0.5)
+    UpdateSelectedLabel()
+    Busy = false
+end
+
+local function StartAutoFarm()
+    if AutoFarm then return end
+    AutoFarm = true
+    AutoFarmButton.Text = "⏸ Стоп"
+    AutoFarmButton.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+    
+    task.spawn(function()
+        while AutoFarm and _G.__FarmRunning do
+            if not Busy then
+                Busy = true
+                pcall(FarmCycle)
+                Busy = false
+            end
+            task.wait(0.3)
+        end
+    end)
+end
+
+local function StopAutoFarm()
+    AutoFarm = false
+    StopMove()
+    AutoFarmButton.Text = "▶ Автофарм"
+    AutoFarmButton.BackgroundColor3 = Color3.fromRGB(60, 160, 60)
+    SetStatus("⏹ Остановлено", Color3.fromRGB(255, 150, 150))
+end
+
+--// ==================== ОБРАБОТЧИКИ ====================
+SpeedBox.FocusLost:Connect(function()
+    local n = tonumber(SpeedBox.Text)
+    if n and n > 0 then
+        CurrentSpeed = n
+        Config.Speed = n
+        SaveConfig()
+        SpeedLabel.Text = "Скорость (studs/s): " .. n
+    else
+        SpeedBox.Text = tostring(CurrentSpeed)
+    end
+end)
+
+StandBox.FocusLost:Connect(function()
+    local n = tonumber(StandBox.Text)
+    if n and n >= 0 then
+        StandTime = n
+        Config.StandTime = n
+        SaveConfig()
+        StandLabel.Text = "Стоять у дырки (сек): " .. n
+    else
+        StandBox.Text = tostring(StandTime)
+    end
+end)
+
+StartButton.MouseButton1Click:Connect(RunOnce)
+AutoFarmButton.MouseButton1Click:Connect(function()
+    if AutoFarm then StopAutoFarm()
+    else
+        if next(SelectedItems) == nil then
+            SetStatus("⚠️ Выберите предметы!", Color3.fromRGB(255, 200, 100))
+            return
+        end
+        StartAutoFarm()
+    end
+end)
+
+CloseButton.MouseButton1Click:Connect(function()
+    MainFrame.Visible = false
+    OpenButton.Visible = true
+    Config.MenuVisible = false
+    SaveConfig()
+end)
+
+OpenButton.MouseButton1Click:Connect(function()
+    MainFrame.Visible = true
+    OpenButton.Visible = false
+    Config.MenuVisible = true
+    SaveConfig()
+end)
+
+MinimizeBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = false
+    OpenButton.Visible = true
+    Config.MenuVisible = false
+    SaveConfig()
+end)
+
+PermanentCloseButton.MouseButton1Click:Connect(function()
+    AutoFarm = false
+    Busy = false
+    StopMove()
+    _G.__FarmRunning = false
+    _G.__FarmKillAll = nil
+    ScreenGui:Destroy()
+end)
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        MainFrame.Visible = not MainFrame.Visible
+        OpenButton.Visible = not MainFrame.Visible
+        Config.MenuVisible = MainFrame.Visible
+        SaveConfig()
+    end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function() StopMove() end)
+
+TargetFolder.ChildAdded:Connect(function()
+    task.wait(0.15)
+    pcall(UpdateAllCounters)
+end)
+TargetFolder.ChildRemoved:Connect(function()
+    task.wait(0.15)
+    pcall(UpdateAllCounters)
+end)
+
+--// ==================== ФОНОВЫЕ ЦИКЛЫ ====================
+task.spawn(function()
+    while _G.__FarmRunning do
+        task.wait(0.5)
+        pcall(UpdateAllCounters)
+    end
+end)
+
+-- 📊 HoleItems обновление (СВЕЖЕЕ значение каждый раз)
+task.spawn(function()
+    while _G.__FarmRunning do
+        task.wait(0.15)
+        pcall(function()
+            local v = GetHoleItems()
+            
+            if HoleItemsPath then
+                HoleItemsLabel.Text = "📦 HoleItems: " .. v .. "  [" .. tostring(HoleItemsPath) .. "]"
+                if v >= HoleTriggerThreshold then
+                    HoleItemsLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+                elseif v > 0 then
+                    HoleItemsLabel.TextColor3 = Color3.fromRGB(255, 220, 100)
+                else
+                    HoleItemsLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+                end
+            else
+                HoleItemsLabel.Text = "📦 HoleItems: ❌ не найден"
+                HoleItemsLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+            end
+        end)
+    end
+end)
+
+-- 🎁 Триггер (с кулдауном, обновляется всегда)
+task.spawn(function()
+    while _G.__FarmRunning do
+        task.wait(0.1)
+        if HoleTriggerEnabled then
+            local v = GetHoleItems()
+            local now = tick()
+            
+            if v >= HoleTriggerThreshold then
+                if (now - lastTriggerTime) >= TRIGGER_COOLDOWN then
+                    lastTriggerTime = now
+                    local ok = FireHoleGive()
+                    if ok then
+                        SetStatus("🎁 Забран (HoleItems=" .. v .. ")", Color3.fromRGB(255, 180, 100))
+                    else
+                        SetStatus("❌ Ошибка HoleGive", Color3.fromRGB(255, 100, 100))
+                    end
+                end
+            end
+        end
+    end
+end)
+
+--// ==================== СТАРТ ====================
+RefreshItemList()
+print("[Farm] Загружено! HoleItems:", HoleItemsPath or "❌", "| Mode:", tostring(HoleItemsMode))
+print("[Farm] Порог:", HoleTriggerThreshold, "| Кулдаун:", TRIGGER_COOLDOWN, "сек")
+print("[Farm] Хоткей RightShift — показать/скрыть меню")
